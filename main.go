@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -165,6 +166,11 @@ func wrapMain() error {
 			EnvVar: "PLUGIN_WAIT_SECONDS",
 			Value:  0,
 		},
+		cli.BoolFlag{
+			Name:   "eks-mode",
+			Usage:  "Use EKS instead of GKE?",
+			EnvVar: "PLUGIN_EKS_MODE",
+		},
 	}
 
 	if err := app.Run(os.Args); err != nil {
@@ -180,9 +186,10 @@ func run(c *cli.Context) error {
 		return err
 	}
 
+	eksMode := c.Bool("eks-mode")
 	// Use project if explicitly stated, otherwise infer from the service account token.
 	project := c.String("project")
-	if project == "" {
+	if project == "" && !eksMode {
 		log("Parsing Project ID from credentials\n")
 		project = getProjectFromToken(c.String("token"))
 		if project == "" {
@@ -206,20 +213,26 @@ func run(c *cli.Context) error {
 	environ = append(environ, fmt.Sprintf("GOOGLE_APPLICATION_CREDENTIALS=%s", keyPath))
 	runner := NewBasicRunner("", environ, os.Stdout, os.Stderr)
 
-	// Auth with gcloud and fetch kubectl credentials
-	if err := fetchCredentials(c, project, runner); err != nil {
-		return err
-	}
-
-	// Delete credentials from filesystem when finishing
-	// Warn if the keyfile can't be deleted, but don't abort.
-	// We're almost certainly running inside an ephemeral container, so the file will be discarded when we're finished anyway.
-	defer func() {
-		err := os.Remove(keyPath)
-		if err != nil {
-			log("Warning: error removing token file: %s\n", err)
+	if eksMode {
+		if err := awsAuth(c); err != nil {
+			return err
 		}
-	}()
+	} else {
+		// Auth with gcloud and fetch kubectl credentials
+		if err := fetchCredentials(c, project, runner); err != nil {
+			return err
+		}
+
+		// Delete credentials from filesystem when finishing
+		// Warn if the keyfile can't be deleted, but don't abort.
+		// We're almost certainly running inside an ephemeral container, so the file will be discarded when we're finished anyway.
+		defer func() {
+			err := os.Remove(keyPath)
+			if err != nil {
+				log("Warning: error removing token file: %s\n", err)
+			}
+		}()
+	}
 
 	// Build template data maps
 	templateData, secretsData, secretsDataRedacted, err := templateData(c, project, vars, secrets)
@@ -275,16 +288,21 @@ func run(c *cli.Context) error {
 
 // checkParams checks required params
 func checkParams(c *cli.Context) error {
-	if c.String("token") == "" {
-		return fmt.Errorf("Missing required param: token")
-	}
+	eksMode := c.Bool("eks-mode")
+	if eksMode && c.String("token") != "" {
+		return errors.New("token shouldn't be specified for EKS")
+	} else if !eksMode {
+		if c.String("token") == "" {
+			return fmt.Errorf("Missing required param: token")
+		}
 
-	if c.String("zone") == "" && c.String("region") == "" {
-		return fmt.Errorf("Missing required param: at least one of region or zone must be specified")
-	}
+		if c.String("zone") == "" && c.String("region") == "" {
+			return fmt.Errorf("Missing required param: at least one of region or zone must be specified")
+		}
 
-	if c.String("zone") != "" && c.String("region") != "" {
-		return fmt.Errorf("Invalid params: at most one of region or zone may be specified")
+		if c.String("zone") != "" && c.String("region") != "" {
+			return fmt.Errorf("Invalid params: at most one of region or zone may be specified")
+		}
 	}
 
 	if c.String("cluster") == "" {
